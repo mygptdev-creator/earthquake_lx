@@ -30,7 +30,7 @@ FDSN_URLS = [
 ACTIVE_FDSN_SERVER = None
 
 # Wat Arun station: shown as TMP027 in the realtime UI, queried as TMP27.
-STATION = os.getenv("STATION", "TMP24")
+STATION = os.getenv("STATION", "TMP27")
 NETWORK = os.getenv("NETWORK", "MU")
 CHANNELS = ["ENE", "ENN", "ENZ"]
 
@@ -39,6 +39,7 @@ CACHE_INTERVAL = int(os.getenv("CACHE_INTERVAL", "5"))
 NUM_SAMPLES = int(os.getenv("NUM_SAMPLES", "500"))
 G_CONST = 9.80665
 MG_TO_MPS2 = 0.00981
+SENSITIVITY_COUNTS_PER_MPS2 = float(os.getenv("SENSITIVITY_COUNTS_PER_MPS2", "26164"))
 PGA_THRESHOLD_MPS2 = float(os.getenv("PGA_THRESHOLD_MPS2", "0.02"))
 THRESHOLD_MG = float(os.getenv("THRESHOLD_MG", str(PGA_THRESHOLD_MPS2 / MG_TO_MPS2)))
 
@@ -51,6 +52,9 @@ SAVE_EXCEEDANCES = os.getenv("SAVE_EXCEEDANCES", "true").lower() in {
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exceedance_events")
+
+EVENT_HANGOVER_SECONDS = float(os.getenv("EVENT_HANGOVER_SECONDS", "3.0"))
+EVENT_MIN_DURATION_SECONDS = float(os.getenv("EVENT_MIN_DURATION_SECONDS", "0.3"))
 
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
@@ -74,7 +78,12 @@ station_inventory = None
 cached_data = None
 last_fetch_time = None
 is_fetching = False
-saved_exceedance_keys = set()
+
+# Event-detection state — survives across fetch cycles, reset on Railway restart.
+# On restart we re-scan the last 90 s window; Supabase's on_conflict policy
+# de-duplicates any event that was already saved before the restart.
+event_last_processed_time = None  # UTCDateTime; samples older than this are skipped
+active_event = None  # dict: { start_time, peak_time, peak_mg, peak_x_mg, peak_y_mg, peak_z_mg, last_above_time, cooldown_seconds }
 
 
 class AccelerationData(BaseModel):
@@ -150,93 +159,121 @@ def init_fdsn():
     return False
 
 
-def detect_exceedance_ranges(
+def update_event_state(
     acc_mg: Dict[str, List[float]],
     sample_start_time,
     sampling_rate: float,
     pga_threshold_mps2: float,
     threshold_mg: float,
 ) -> List[ExceedanceRange]:
+    """
+    Stateful event detector. Returns a list of FINALIZED events (zero or one per call,
+    occasionally more if multiple events end within one window).
+
+    State machine:
+      IDLE     → vector > threshold     → ACTIVE (record start_time, peak)
+      ACTIVE   → vector > threshold     → update peak if greater; reset cooldown
+      ACTIVE   → vector <= threshold    → accumulate cooldown_seconds
+      cooldown ≥ EVENT_HANGOVER_SECONDS → finalize event, return it, → IDLE
+    """
+    global event_last_processed_time, active_event
+
     if not sample_start_time or sampling_rate <= 0:
         return []
 
     sample_count = min(len(acc_mg["x"]), len(acc_mg["y"]), len(acc_mg["z"]))
-    ranges: List[ExceedanceRange] = []
-    active_start = None
-    active_peak = None
-    active_peak_value = 0.0
+    if sample_count == 0:
+        return []
 
-    def vector_mg(index: int) -> float:
+    sample_dt = 1.0 / sampling_rate
+    finalized: List[ExceedanceRange] = []
+
+    def vector_mg_at(index: int) -> float:
         return math.sqrt(
             acc_mg["x"][index] ** 2
             + acc_mg["y"][index] ** 2
             + acc_mg["z"][index] ** 2
         )
 
-    def close_range(end_index: int):
-        nonlocal active_start, active_peak, active_peak_value
-        start_time = sample_start_time + (active_start / sampling_rate)
-        end_time = sample_start_time + (end_index / sampling_rate)
-        peak_time = sample_start_time + (active_peak / sampling_rate)
-        ranges.append(
+    def finalize_active():
+        nonlocal finalized
+        global active_event
+        if active_event is None:
+            return
+        duration = float(active_event["last_above_time"] - active_event["start_time"])
+        if duration < EVENT_MIN_DURATION_SECONDS:
+            # discard spike too short to count as an event
+            active_event = None
+            return
+        finalized.append(
             ExceedanceRange(
                 station=STATION,
                 network=NETWORK,
                 threshold_mg=threshold_mg,
-                start_index=active_start,
-                end_index=end_index,
-                start_time=utcdate_to_bangkok_iso(start_time),
-                end_time=utcdate_to_bangkok_iso(end_time),
-                peak_index=active_peak,
-                peak_time=utcdate_to_bangkok_iso(peak_time),
-                peak_mg=active_peak_value,
-                peak_x_mg=acc_mg["x"][active_peak],
-                peak_y_mg=acc_mg["y"][active_peak],
-                peak_z_mg=acc_mg["z"][active_peak],
-                duration_seconds=((end_index - active_start) + 1) / sampling_rate,
+                start_index=0,
+                end_index=0,
+                start_time=utcdate_to_bangkok_iso(active_event["start_time"]),
+                end_time=utcdate_to_bangkok_iso(active_event["last_above_time"]),
+                peak_index=0,
+                peak_time=utcdate_to_bangkok_iso(active_event["peak_time"]),
+                peak_mg=active_event["peak_mg"],
+                peak_x_mg=active_event["peak_x_mg"],
+                peak_y_mg=active_event["peak_y_mg"],
+                peak_z_mg=active_event["peak_z_mg"],
+                duration_seconds=max(duration, 0.0),
             )
         )
-        active_start = None
-        active_peak = None
-        active_peak_value = 0.0
+        active_event = None
 
     for index in range(sample_count):
-        value_mg = vector_mg(index)
+        sample_time = sample_start_time + (index * sample_dt)
+        # Skip samples already processed in a previous fetch (overlap protection)
+        if event_last_processed_time is not None and sample_time <= event_last_processed_time:
+            continue
+
+        value_mg = vector_mg_at(index)
         value_mps2 = value_mg * MG_TO_MPS2
+
         if value_mps2 > pga_threshold_mps2:
-            if active_start is None:
-                active_start = index
-                active_peak = index
-                active_peak_value = value_mg
-            elif value_mg > active_peak_value:
-                active_peak = index
-                active_peak_value = value_mg
-        elif active_start is not None:
-            close_range(index - 1)
+            if active_event is None:
+                active_event = {
+                    "start_time": sample_time,
+                    "peak_time": sample_time,
+                    "peak_mg": value_mg,
+                    "peak_x_mg": acc_mg["x"][index],
+                    "peak_y_mg": acc_mg["y"][index],
+                    "peak_z_mg": acc_mg["z"][index],
+                    "last_above_time": sample_time,
+                    "cooldown_seconds": 0.0,
+                }
+            else:
+                active_event["last_above_time"] = sample_time
+                active_event["cooldown_seconds"] = 0.0
+                if value_mg > active_event["peak_mg"]:
+                    active_event["peak_mg"] = value_mg
+                    active_event["peak_time"] = sample_time
+                    active_event["peak_x_mg"] = acc_mg["x"][index]
+                    active_event["peak_y_mg"] = acc_mg["y"][index]
+                    active_event["peak_z_mg"] = acc_mg["z"][index]
+        else:
+            if active_event is not None:
+                active_event["cooldown_seconds"] += sample_dt
+                if active_event["cooldown_seconds"] >= EVENT_HANGOVER_SECONDS:
+                    finalize_active()
 
-    if active_start is not None:
-        close_range(sample_count - 1)
+        event_last_processed_time = sample_time
 
-    return ranges
+    return finalized
 
 
-def save_exceedances_to_supabase(ranges: List[ExceedanceRange]) -> None:
-    if not SAVE_EXCEEDANCES or not ranges:
+def save_exceedances_to_supabase(events: List[ExceedanceRange]) -> None:
+    if not SAVE_EXCEEDANCES or not events:
         return
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        print("[WARN] Supabase env vars not set; exceedance ranges were not saved")
+        print("[WARN] Supabase env vars not set; exceedance events were not saved")
         return
 
-    rows = []
-    for item in ranges:
-        dedupe_key = (item.station, item.start_time, item.end_time)
-        if dedupe_key in saved_exceedance_keys:
-            continue
-        rows.append(model_dump(item))
-        saved_exceedance_keys.add(dedupe_key)
-
-    if not rows:
-        return
+    rows = [model_dump(item) for item in events]
 
     url = (
         f"{SUPABASE_URL.rstrip('/')}/rest/v1/{SUPABASE_TABLE}"
@@ -280,30 +317,67 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
         end = UTCDateTime.now()
         start = end - FETCH_WINDOW
         stream = Stream()
+        failed_channels: List[str] = []
 
         for ch in CHANNELS:
             try:
                 trace = fdsn_client.get_waveforms(NETWORK, STATION, "00", ch, start, end)
                 stream += trace
-            except Exception:
-                pass
+            except Exception as exc:
+                failed_channels.append(ch)
+                print(f"[WARN] fetch {ch} failed: {exc}")
 
-        if len(stream) == 0:
+        # If any channel failed, keep last-good cache instead of injecting zeros.
+        # A partial waveform with one axis flat at 0 misleads peak detection and exceedance state.
+        if failed_channels:
+            print(f"[WARN] incomplete fetch: missing {failed_channels} — keeping cached data")
             return cached_data
 
         try:
             stream.merge(method=0, fill_value="interpolate", interpolation_samples=0)
+        except Exception as exc:
+            print(f"[WARN] stream.merge failed: {exc}")
+            return cached_data
+
+        channels_present = {t.stats.channel for t in stream}
+        if not {"ENE", "ENN", "ENZ"}.issubset(channels_present):
+            print(f"[WARN] channels after merge: {channels_present} — keeping cached data")
+            return cached_data
+
+        # Align all axes to a shared time window before slicing the trailing samples.
+        # Without this, each trace independently took its last 500 samples and the three
+        # graphs ended up at slightly different wall-clock times.
+        try:
+            common_start = max(t.stats.starttime for t in stream)
+            common_end = min(t.stats.endtime for t in stream)
+            if common_end - common_start <= 0:
+                print("[WARN] no overlapping time window across channels — keeping cached data")
+                return cached_data
+            stream.trim(starttime=common_start, endtime=common_end)
+        except Exception as exc:
+            print(f"[WARN] trim failed: {exc}")
+            return cached_data
+
+        # Reject masked traces (gap in the trimmed window) rather than letting NaN-ish
+        # values silently become 0 downstream.
+        for t in stream:
+            data = t.data
+            if hasattr(data, "mask") and np.ma.is_masked(data) and bool(np.any(data.mask)):
+                print(f"[WARN] {t.stats.channel}: gap in trimmed window — keeping cached data")
+                return cached_data
+
+        try:
             stream.detrend("demean")
-            stream.filter("bandpass", freqmin=0.1, freqmax=50, corners=3)
-            stream.attach_response(station_inventory)
-            resp_removed = stream.remove_response(output="ACC")
-        except Exception:
+            for trace in stream:
+                trace.data = trace.data / SENSITIVITY_COUNTS_PER_MPS2
+        except Exception as exc:
+            print(f"[WARN] detrend/scale failed: {exc}")
             return cached_data
 
         acc = {"x": [], "y": [], "z": []}
         sample_meta: Dict[str, Dict[str, Any]] = {}
 
-        for trace in resp_removed:
+        for trace in stream:
             if len(trace.data) == 0:
                 continue
 
@@ -327,9 +401,10 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
                 acc["z"] = samples_list
                 sample_meta["z"] = meta
 
-        for axis in ["x", "y", "z"]:
-            if not acc[axis]:
-                acc[axis] = [0.0] * NUM_SAMPLES
+        # All three axes must be non-empty — abort and keep cache otherwise.
+        if not (acc["x"] and acc["y"] and acc["z"]):
+            print("[WARN] one or more axes empty after slicing — keeping cached data")
+            return cached_data
 
         acc_mg = {
             "x": [(v / G_CONST) * 1000 for v in acc["x"]],
@@ -337,22 +412,25 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
             "z": [(v / G_CONST) * 1000 for v in acc["z"]],
         }
 
-        peak_x = max(abs(v) for v in acc["x"])
-        peak_y = max(abs(v) for v in acc["y"])
-        peak_z = max(abs(v) for v in acc["z"])
-        intensity = math.sqrt(peak_x**2 + peak_y**2 + peak_z**2)
+        # PGA = max over t of |a(t)|, where a is the 3D vector. Peak per axis taken
+        # at different times (the old method) inflates the magnitude.
+        ax = np.asarray(acc["x"], dtype=float)
+        ay = np.asarray(acc["y"], dtype=float)
+        az = np.asarray(acc["z"], dtype=float)
+        vector_at_t = np.sqrt(ax * ax + ay * ay + az * az)
+        intensity = float(vector_at_t.max()) if vector_at_t.size > 0 else 0.0
 
         ref_meta = sample_meta.get("z") or sample_meta.get("x") or sample_meta.get("y")
-        exceedance_ranges: List[ExceedanceRange] = []
+        exceedance_events: List[ExceedanceRange] = []
         if ref_meta:
-            exceedance_ranges = detect_exceedance_ranges(
+            exceedance_events = update_event_state(
                 acc_mg=acc_mg,
                 sample_start_time=ref_meta["start_time"],
                 sampling_rate=ref_meta["sampling_rate"],
                 pga_threshold_mps2=PGA_THRESHOLD_MPS2,
                 threshold_mg=THRESHOLD_MG,
             )
-            save_exceedances_to_supabase(exceedance_ranges)
+            save_exceedances_to_supabase(exceedance_events)
 
         thai_time_now = thai_now()
         data_time = thai_time_now - timedelta(seconds=5)
@@ -365,7 +443,7 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
             intensity_peak=intensity,
             intensity_peak_mg=intensity / G_CONST * 1000,
             threshold_mg=THRESHOLD_MG,
-            exceedance_ranges=exceedance_ranges,
+            exceedance_ranges=exceedance_events,
             cached=False,
         )
         cached_data = data
@@ -433,8 +511,13 @@ async def health():
         "active_fdsn_server": ACTIVE_FDSN_SERVER,
         "station": STATION,
         "network": NETWORK,
+        "sensitivity_counts_per_mps2": SENSITIVITY_COUNTS_PER_MPS2,
         "pga_threshold_mps2": PGA_THRESHOLD_MPS2,
         "threshold_mg": THRESHOLD_MG,
+        "event_hangover_seconds": EVENT_HANGOVER_SECONDS,
+        "event_min_duration_seconds": EVENT_MIN_DURATION_SECONDS,
+        "active_event_in_progress": active_event is not None,
+        "last_fetch_time": last_fetch_time.isoformat() if last_fetch_time else None,
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
     }
 
