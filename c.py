@@ -317,20 +317,16 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
         end = UTCDateTime.now()
         start = end - FETCH_WINDOW
         stream = Stream()
-        failed_channels: List[str] = []
 
         for ch in CHANNELS:
             try:
                 trace = fdsn_client.get_waveforms(NETWORK, STATION, "00", ch, start, end)
                 stream += trace
             except Exception as exc:
-                failed_channels.append(ch)
                 print(f"[WARN] fetch {ch} failed: {exc}")
 
-        # If any channel failed, keep last-good cache instead of injecting zeros.
-        # A partial waveform with one axis flat at 0 misleads peak detection and exceedance state.
-        if failed_channels:
-            print(f"[WARN] incomplete fetch: missing {failed_channels} — keeping cached data")
+        if len(stream) == 0:
+            print("[WARN] no channels returned data — keeping cached data")
             return cached_data
 
         try:
@@ -339,32 +335,16 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
             print(f"[WARN] stream.merge failed: {exc}")
             return cached_data
 
-        channels_present = {t.stats.channel for t in stream}
-        if not {"ENE", "ENN", "ENZ"}.issubset(channels_present):
-            print(f"[WARN] channels after merge: {channels_present} — keeping cached data")
-            return cached_data
-
-        # Align all axes to a shared time window before slicing the trailing samples.
-        # Without this, each trace independently took its last 500 samples and the three
-        # graphs ended up at slightly different wall-clock times.
-        try:
-            common_start = max(t.stats.starttime for t in stream)
-            common_end = min(t.stats.endtime for t in stream)
-            if common_end - common_start <= 0:
-                print("[WARN] no overlapping time window across channels — keeping cached data")
-                return cached_data
-            stream.trim(starttime=common_start, endtime=common_end)
-        except Exception as exc:
-            print(f"[WARN] trim failed: {exc}")
-            return cached_data
-
-        # Reject masked traces (gap in the trimmed window) rather than letting NaN-ish
-        # values silently become 0 downstream.
-        for t in stream:
-            data = t.data
-            if hasattr(data, "mask") and np.ma.is_masked(data) and bool(np.any(data.mask)):
-                print(f"[WARN] {t.stats.channel}: gap in trimmed window — keeping cached data")
-                return cached_data
+        # Align axes to a shared time window when ≥2 traces overlap — improves visual
+        # sync between graphs without aborting on partial data.
+        if len(stream) >= 2:
+            try:
+                common_start = max(t.stats.starttime for t in stream)
+                common_end = min(t.stats.endtime for t in stream)
+                if common_end - common_start > 0:
+                    stream.trim(starttime=common_start, endtime=common_end)
+            except Exception as exc:
+                print(f"[WARN] trim skipped: {exc}")
 
         try:
             stream.detrend("demean")
@@ -374,7 +354,7 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
             print(f"[WARN] detrend/scale failed: {exc}")
             return cached_data
 
-        acc = {"x": [], "y": [], "z": []}
+        acc_fresh: Dict[str, Optional[List[float]]] = {"x": None, "y": None, "z": None}
         sample_meta: Dict[str, Dict[str, Any]] = {}
 
         for trace in stream:
@@ -382,6 +362,10 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
                 continue
 
             recent_samples = trace.data[-min(NUM_SAMPLES, len(trace.data)) :]
+            # Fill masked samples (gaps after merge) with 0 instead of rejecting the trace.
+            if hasattr(recent_samples, "filled"):
+                recent_samples = recent_samples.filled(0.0)
+
             samples_list = [float(val) for val in recent_samples]
             sample_start_index = len(trace.data) - len(recent_samples)
             meta = {
@@ -392,19 +376,33 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
 
             ch_name = trace.stats.channel
             if ch_name == "ENE":
-                acc["x"] = samples_list
+                acc_fresh["x"] = samples_list
                 sample_meta["x"] = meta
             elif ch_name == "ENN":
-                acc["y"] = samples_list
+                acc_fresh["y"] = samples_list
                 sample_meta["y"] = meta
             elif ch_name == "ENZ":
-                acc["z"] = samples_list
+                acc_fresh["z"] = samples_list
                 sample_meta["z"] = meta
 
-        # All three axes must be non-empty — abort and keep cache otherwise.
-        if not (acc["x"] and acc["y"] and acc["z"]):
-            print("[WARN] one or more axes empty after slicing — keeping cached data")
-            return cached_data
+        # Per-axis fallback: fresh data if available, otherwise keep last-good values from
+        # cache. This avoids the prior "one axis flatlines at 0" symptom while still
+        # surfacing live data on the axes that did succeed.
+        acc: Dict[str, List[float]] = {}
+        missing_axes: List[str] = []
+        for axis in ["x", "y", "z"]:
+            fresh = acc_fresh[axis]
+            if fresh is not None:
+                acc[axis] = fresh
+            elif cached_data is not None:
+                acc[axis] = list(getattr(cached_data.acceleration, axis))
+                missing_axes.append(axis)
+            else:
+                acc[axis] = [0.0] * NUM_SAMPLES
+                missing_axes.append(axis)
+
+        if missing_axes:
+            print(f"[WARN] axes preserved from cache: {missing_axes}")
 
         acc_mg = {
             "x": [(v / G_CONST) * 1000 for v in acc["x"]],
@@ -420,9 +418,13 @@ def fetch_earthquake_data_sync() -> Optional[EarthquakeData]:
         vector_at_t = np.sqrt(ax * ax + ay * ay + az * az)
         intensity = float(vector_at_t.max()) if vector_at_t.size > 0 else 0.0
 
+        # Run event detection only when all three axes are fresh this fetch. Mixing
+        # stale (cached) and fresh values would produce a meaningless per-sample vector
+        # and corrupt the event state machine.
         ref_meta = sample_meta.get("z") or sample_meta.get("x") or sample_meta.get("y")
         exceedance_events: List[ExceedanceRange] = []
-        if ref_meta:
+        all_axes_fresh = not missing_axes
+        if all_axes_fresh and ref_meta:
             exceedance_events = update_event_state(
                 acc_mg=acc_mg,
                 sample_start_time=ref_meta["start_time"],
